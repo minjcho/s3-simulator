@@ -1,0 +1,502 @@
+/*
+ * Mini S3 - 종합 실험 및 벤치마크
+ *
+ * [1] GF(256) 필드 공리 전수 검증
+ * [2] 이레이저 코딩 전수 검사 (255개 고장 패턴)
+ * [3] 대용량 랜덤 데이터 복구 검증
+ * [4] Power of Two Choices 통계 분석
+ * [5] 인코딩/디코딩 처리량 벤치마크
+ * [6] 읽기 꼬리 지연시간 시뮬레이션
+ * [7] 저장 방식 효율 비교
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <math.h>
+#include "gf256.h"
+#include "erasure.h"
+
+#define K 5  /* data shards   */
+#define M 4  /* parity shards */
+#define N 9  /* total shards  */
+
+/* ---- utilities ---- */
+
+static double now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+static int dbl_cmp(const void *a, const void *b)
+{
+    double x = *(const double *)a, y = *(const double *)b;
+    return (x > y) - (x < y);
+}
+
+static double vec_stddev(const int *a, int n)
+{
+    double m = 0;
+    for (int i = 0; i < n; i++) m += a[i];
+    m /= n;
+    double v = 0;
+    for (int i = 0; i < n; i++) { double d = a[i] - m; v += d * d; }
+    return sqrt(v / n);
+}
+
+static int vec_max(const int *a, int n)
+{
+    int m = a[0];
+    for (int i = 1; i < n; i++) if (a[i] > m) m = a[i];
+    return m;
+}
+
+static int vec_min(const int *a, int n)
+{
+    int m = a[0];
+    for (int i = 1; i < n; i++) if (a[i] < m) m = a[i];
+    return m;
+}
+
+/* ================================================================
+ * [1] GF(256) 필드 공리 검증
+ *
+ * 이레이저 코딩의 수학적 기반인 GF(256)이 올바르게 구현되었는지
+ * 4가지 필드 공리를 전수/샘플 검사한다.
+ * ================================================================ */
+static void test_gf256(void)
+{
+    printf("[1] GF(256) 필드 공리 검증\n");
+    printf("--------------------------------------------\n");
+
+    int ok = 1, pass;
+
+    /* 항등원: a * 1 = a, 전수 검사 (256개) */
+    pass = 0;
+    for (int a = 0; a < 256; a++)
+        if (gf256_mul((uint8_t)a, 1) == (uint8_t)a) pass++;
+    printf("  곱셈 항등원 (a*1=a):       %d/256\n", pass);
+    ok = ok && (pass == 256);
+
+    /* 역원: a * inv(a) = 1, 전수 검사 (255개, 0 제외) */
+    pass = 0;
+    for (int a = 1; a < 256; a++)
+        if (gf256_mul((uint8_t)a, gf256_inv((uint8_t)a)) == 1) pass++;
+    printf("  곱셈 역원 (a*a^-1=1):      %d/255\n", pass);
+    ok = ok && (pass == 255);
+
+    /* 교환법칙: a*b = b*a, 전수 검사 (65536 쌍) */
+    pass = 0;
+    for (int a = 0; a < 256; a++)
+        for (int b = 0; b < 256; b++)
+            if (gf256_mul((uint8_t)a, (uint8_t)b) ==
+                gf256_mul((uint8_t)b, (uint8_t)a))
+                pass++;
+    printf("  교환법칙 (a*b=b*a):        %d/65536\n", pass);
+    ok = ok && (pass == 65536);
+
+    /* 분배법칙: a*(b+c) = a*b + a*c, 10만 샘플 */
+    pass = 0;
+    int total = 100000;
+    for (int i = 0; i < total; i++) {
+        uint8_t a = rand() & 0xFF, b = rand() & 0xFF, c = rand() & 0xFF;
+        if (gf256_mul(a, b ^ c) == (gf256_mul(a, b) ^ gf256_mul(a, c)))
+            pass++;
+    }
+    printf("  분배법칙 (a*(b+c)=ab+ac):  %d/%d\n", pass, total);
+    ok = ok && (pass == total);
+
+    printf("  결과: %s\n\n", ok ? "PASS" : "FAIL");
+}
+
+/* ================================================================
+ * [2] 이레이저 코딩 전수 검사
+ *
+ * 고장 1~4개에 대해 가능한 모든 조합 C(9,f)을 테스트한다.
+ * 총 C(9,1)+C(9,2)+C(9,3)+C(9,4) = 9+36+84+126 = 255 패턴.
+ * MDS 코드 성질에 의해 전부 복구 가능해야 한다.
+ * ================================================================ */
+
+static int test_pattern(erasure_t *ec, const uint8_t *enc,
+                        size_t ss, const int *fail, int nf)
+{
+    uint8_t *w = malloc(N * ss);
+    memcpy(w, enc, N * ss);
+    uint8_t *sh[N];
+    int pr[N];
+    for (int i = 0; i < N; i++) {
+        sh[i] = w + (size_t)i * ss;
+        pr[i] = 1;
+    }
+    for (int f = 0; f < nf; f++) {
+        pr[fail[f]] = 0;
+        memset(sh[fail[f]], 0, ss);
+    }
+    int ret = erasure_decode(ec, sh, ss, pr);
+    int ok = (ret == 0 && memcmp(w, enc, K * ss) == 0);
+    free(w);
+    return ok;
+}
+
+static void test_erasure_exhaustive(void)
+{
+    printf("[2] 이레이저 코딩 전수 검사\n");
+    printf("--------------------------------------------\n");
+    printf("  설정: %d 데이터 + %d 패리티 = %d 조각\n\n", K, M, N);
+
+    erasure_t ec;
+    erasure_init(&ec, K, M);
+
+    size_t ss = 64;
+    uint8_t *mem = calloc(N, ss);
+    for (size_t i = 0; i < K * ss; i++)
+        mem[i] = rand() & 0xFF;
+    uint8_t *sh[N];
+    for (int i = 0; i < N; i++) sh[i] = mem + (size_t)i * ss;
+    erasure_encode(&ec, sh, ss);
+
+    int all_pass = 0, all_total = 0;
+
+    for (int nf = 1; nf <= M; nf++) {
+        int pass = 0, total = 0;
+        int idx[4];
+        for (int i = 0; i < nf; i++) idx[i] = i;
+
+        for (;;) {
+            total++;
+            pass += test_pattern(&ec, mem, ss, idx, nf);
+
+            int i = nf - 1;
+            while (i >= 0 && idx[i] == N - nf + i) i--;
+            if (i < 0) break;
+            idx[i]++;
+            for (int j = i + 1; j < nf; j++) idx[j] = idx[j - 1] + 1;
+        }
+
+        printf("  고장 %d개: %3d/%-3d (C(%d,%d) 패턴 전수 검사)\n",
+               nf, pass, total, N, nf);
+        all_pass += pass;
+        all_total += total;
+    }
+
+    printf("\n  총 %d개 패턴: %s\n\n", all_total,
+           (all_pass == all_total) ? "PASS" : "FAIL");
+    free(mem);
+    erasure_free(&ec);
+}
+
+/* ================================================================
+ * [3] 대용량 랜덤 데이터 복구 검증
+ *
+ * 다양한 크기의 랜덤 데이터에 대해 임의 개수(1~4)의
+ * 랜덤 고장을 발생시키고 복구를 검증한다.
+ * ================================================================ */
+static void test_erasure_random(void)
+{
+    printf("[3] 대용량 랜덤 데이터 복구 검증\n");
+    printf("--------------------------------------------\n");
+
+    erasure_t ec;
+    erasure_init(&ec, K, M);
+
+    struct { size_t size; const char *label; int trials; } cfgs[] = {
+        {100,     "100 B ", 100},
+        {1024,    "1 KB  ", 100},
+        {65536,   "64 KB ", 50},
+        {1048576, "1 MB  ", 20},
+    };
+    int all_ok = 1;
+
+    for (int c = 0; c < 4; c++) {
+        size_t dsz = cfgs[c].size;
+        size_t ss = (dsz + K - 1) / K;
+        int trials = cfgs[c].trials;
+        int pass = 0;
+
+        for (int t = 0; t < trials; t++) {
+            uint8_t *mem = calloc(N, ss);
+            uint8_t *sh_arr[N];
+            for (int i = 0; i < N; i++)
+                sh_arr[i] = mem + (size_t)i * ss;
+            for (size_t i = 0; i < dsz; i++)
+                mem[i] = rand() & 0xFF;
+
+            uint8_t *orig = malloc(K * ss);
+            memcpy(orig, mem, K * ss);
+            erasure_encode(&ec, sh_arr, ss);
+
+            int nf = 1 + rand() % M;
+            int pr[N];
+            for (int i = 0; i < N; i++) pr[i] = 1;
+            int d = 0;
+            while (d < nf) {
+                int x = rand() % N;
+                if (!pr[x]) continue;
+                pr[x] = 0;
+                memset(sh_arr[x], 0, ss);
+                d++;
+            }
+
+            int ret = erasure_decode(&ec, sh_arr, ss, pr);
+            if (ret == 0 && memcmp(mem, orig, K * ss) == 0) pass++;
+            free(mem);
+            free(orig);
+        }
+
+        printf("  %s: %d/%d 통과 (랜덤 1~%d개 고장)\n",
+               cfgs[c].label, pass, trials, M);
+        if (pass != trials) all_ok = 0;
+    }
+
+    printf("  결과: %s\n\n", all_ok ? "PASS" : "FAIL");
+    erasure_free(&ec);
+}
+
+/* ================================================================
+ * [4] Power of Two Choices 통계 분석
+ *
+ * 디스크 수를 16~512로 변화시키며, 랜덤 배치와 P2C를
+ * 200회 시행하여 최대 부하, 최소 부하, 표준편차를 비교한다.
+ *
+ * 이론적 기대:
+ *   랜덤: max load ≈ mean + O(sqrt(mean * ln(n)))
+ *   P2C:  max load ≈ mean + O(ln ln n)
+ * ================================================================ */
+static void test_p2c(void)
+{
+    printf("[4] Power of Two Choices 통계 분석\n");
+    printf("--------------------------------------------\n");
+
+    int disks[] = {16, 32, 64, 128, 256, 512};
+    int ncfg = 6;
+    int lf = 100;
+    int trials = 200;
+
+    printf("  부하율 %d (디스크당 평균 %d개), %d회 시행\n\n", lf, lf, trials);
+    printf("  | 디스크 | 방식 | 평균 최대 | 평균 최소 | 표준편차 | 최대/평균 |\n");
+    printf("  |--------|------|----------|----------|---------|----------|\n");
+
+    for (int c = 0; c < ncfg; c++) {
+        int nd = disks[c];
+        int items = lf * nd;
+        double mean = (double)lf;
+
+        /* 랜덤 배치 */
+        double r_mx = 0, r_mn = 0, r_sd = 0;
+        for (int t = 0; t < trials; t++) {
+            int *cnt = calloc((size_t)nd, sizeof(int));
+            for (int i = 0; i < items; i++)
+                cnt[rand() % nd]++;
+            r_mx += vec_max(cnt, nd);
+            r_mn += vec_min(cnt, nd);
+            r_sd += vec_stddev(cnt, nd);
+            free(cnt);
+        }
+        r_mx /= trials; r_mn /= trials; r_sd /= trials;
+
+        printf("  | %5d  | rand | %8.1f | %8.1f | %7.1f | %8.4f |\n",
+               nd, r_mx, r_mn, r_sd, r_mx / mean);
+
+        /* Power of Two Choices */
+        double p_mx = 0, p_mn = 0, p_sd = 0;
+        for (int t = 0; t < trials; t++) {
+            int *cnt = calloc((size_t)nd, sizeof(int));
+            for (int i = 0; i < items; i++) {
+                int a = rand() % nd, b;
+                do { b = rand() % nd; } while (b == a);
+                cnt[(cnt[a] <= cnt[b]) ? a : b]++;
+            }
+            p_mx += vec_max(cnt, nd);
+            p_mn += vec_min(cnt, nd);
+            p_sd += vec_stddev(cnt, nd);
+            free(cnt);
+        }
+        p_mx /= trials; p_mn /= trials; p_sd /= trials;
+
+        printf("  | %5d  | P2C  | %8.1f | %8.1f | %7.1f | %8.4f |\n",
+               nd, p_mx, p_mn, p_sd, p_mx / mean);
+    }
+    printf("\n");
+}
+
+/* ================================================================
+ * [5] 인코딩/디코딩 처리량 벤치마크
+ *
+ * 다양한 크기의 데이터에 대해 인코딩/디코딩 처리량(MB/s)을 측정한다.
+ * 디코딩은 3개 데이터 + 1개 패리티 고장 (최악에 가까운 시나리오).
+ * ================================================================ */
+static void bench_throughput(void)
+{
+    printf("[5] 인코딩/디코딩 처리량 벤치마크\n");
+    printf("--------------------------------------------\n");
+    printf("  디코딩: 4개 고장 (데이터 3 + 패리티 1) 복구\n");
+
+    erasure_t ec;
+    erasure_init(&ec, K, M);
+
+    struct { size_t size; const char *label; int iters; } cfgs[] = {
+        {1024,    "1 KB  ", 5000},
+        {4096,    "4 KB  ", 3000},
+        {16384,   "16 KB ", 1000},
+        {65536,   "64 KB ", 500},
+        {262144,  "256 KB", 100},
+        {1048576, "1 MB  ", 30},
+    };
+    int ncfg = 6;
+
+    printf("\n  | 데이터 크기 | 인코딩 (MB/s) | 디코딩 (MB/s) |\n");
+    printf("  |------------|--------------|---------------|\n");
+
+    for (int c = 0; c < ncfg; c++) {
+        size_t total = cfgs[c].size;
+        size_t ss = (total + K - 1) / K;
+        int iters = cfgs[c].iters;
+
+        uint8_t *mem = calloc(N, ss);
+        uint8_t *sh[N];
+        for (int i = 0; i < N; i++)
+            sh[i] = mem + (size_t)i * ss;
+        for (size_t i = 0; i < total; i++)
+            mem[i] = rand() & 0xFF;
+
+        /* 인코딩 벤치마크 */
+        double t0 = now();
+        for (int i = 0; i < iters; i++)
+            erasure_encode(&ec, sh, ss);
+        double enc_mbs = (double)total * iters / (now() - t0)
+                         / (1024.0 * 1024.0);
+
+        /* 디코딩 벤치마크 */
+        int pr[N] = {0, 0, 0, 1, 1, 0, 1, 1, 1};
+        int fail[] = {0, 1, 2, 5};
+
+        t0 = now();
+        for (int i = 0; i < iters; i++) {
+            for (int f = 0; f < 4; f++)
+                memset(sh[fail[f]], 0, ss);
+            erasure_decode(&ec, sh, ss, pr);
+        }
+        double dec_mbs = (double)total * iters / (now() - t0)
+                         / (1024.0 * 1024.0);
+
+        printf("  | %9s  | %12.1f | %13.1f |\n",
+               cfgs[c].label, enc_mbs, dec_mbs);
+        free(mem);
+    }
+
+    printf("\n");
+    erasure_free(&ec);
+}
+
+/* ================================================================
+ * [6] 읽기 꼬리 지연시간 시뮬레이션
+ *
+ * "하드 하나가 굉장히 느리면 어쩔 거예요. 이레이저 코딩을 써 놨으면
+ *  이거를 기다릴 필요가 없습니다. 그냥 버리고 다른 하드디스크에 있는
+ *  조각을 빠르게 꺼내오면 되는 거예요." -- 영상 3:44
+ *
+ * 기본 읽기: 데이터 조각 5개만 요청, 전부 도착할 때까지 대기
+ * 헤지 읽기: 전체 9개 요청, 가장 빠른 5개 도착 시점에 완료
+ * ================================================================ */
+static void test_tail_latency(void)
+{
+    printf("[6] 읽기 꼬리 지연시간 시뮬레이션\n");
+    printf("--------------------------------------------\n");
+    printf("  정상 디스크: 1-5ms\n");
+    printf("  지연 디스크 (5%% 확률): 50-200ms\n");
+
+    int nr = 100000;
+    double *naive  = malloc((size_t)nr * sizeof(double));
+    double *hedged = malloc((size_t)nr * sizeof(double));
+
+    for (int r = 0; r < nr; r++) {
+        double lat[N];
+        for (int i = 0; i < N; i++)
+            lat[i] = ((rand() % 100) < 5)
+                     ? 50.0 + (rand() % 151)
+                     : 1.0 + (rand() % 5);
+
+        /* 기본: 데이터 조각 5개만 읽기, 가장 느린 것이 완료 시간 */
+        double mx = 0;
+        for (int i = 0; i < K; i++)
+            if (lat[i] > mx) mx = lat[i];
+        naive[r] = mx;
+
+        /* 헤지: 9개 전부 읽기, 5번째로 빠른 것이 완료 시간 */
+        double s[N];
+        memcpy(s, lat, sizeof(s));
+        for (int i = 0; i < N - 1; i++)
+            for (int j = i + 1; j < N; j++)
+                if (s[j] < s[i]) { double t = s[i]; s[i] = s[j]; s[j] = t; }
+        hedged[r] = s[K - 1];
+    }
+
+    qsort(naive,  (size_t)nr, sizeof(double), dbl_cmp);
+    qsort(hedged, (size_t)nr, sizeof(double), dbl_cmp);
+
+    printf("  시행: %d회\n\n", nr);
+    printf("  | 백분위 | 기본 (5개 대기) | 헤지 (9개 중 5개) | 개선율  |\n");
+    printf("  |--------|---------------|------------------|---------|\n");
+
+    double pct[] = {0.50, 0.90, 0.95, 0.99, 0.999};
+    const char *lbl[] = {"P50  ", "P90  ", "P95  ", "P99  ", "P99.9"};
+
+    for (int i = 0; i < 5; i++) {
+        int idx = (int)(pct[i] * nr);
+        if (idx >= nr) idx = nr - 1;
+        double nv = naive[idx], hv = hedged[idx];
+        double imp = (nv > 0) ? (1.0 - hv / nv) * 100.0 : 0;
+        printf("  | %s  | %10.1f ms | %13.1f ms | %6.1f%% |\n",
+               lbl[i], nv, hv, imp);
+    }
+
+    printf("\n");
+    free(naive);
+    free(hedged);
+}
+
+/* ================================================================
+ * [7] 저장 방식 효율 비교
+ *
+ * 복제(replication) vs 이레이저 코딩(erasure coding)의
+ * 저장 효율과 내결함성을 비교한다.
+ * 저장 배율 = 전체 저장 용량 / 원본 데이터 크기
+ * ================================================================ */
+static void print_storage_cmp(void)
+{
+    printf("[7] 저장 방식 효율 비교\n");
+    printf("--------------------------------------------\n\n");
+    printf("  | 방식              | 저장 배율 | 내결함성 (디스크) | 최소 디스크 |\n");
+    printf("  |-------------------|----------|-----------------|------------|\n");
+    printf("  | 복제 없음          | 1.0x     | 0               | 1          |\n");
+    printf("  | 2중 복제           | 2.0x     | 1               | 2          |\n");
+    printf("  | 3중 복제           | 3.0x     | 2               | 3          |\n");
+    printf("  | RS(5,4) - S3 방식  | 1.8x     | 4               | 9          |\n");
+    printf("  | RS(10,4)          | 1.4x     | 4               | 14         |\n");
+    printf("  | RS(16,4)          | 1.25x    | 4               | 20         |\n");
+    printf("\n  -> RS(5,4): 3중 복제 대비 40%% 적은 용량으로 2배 높은 내결함성\n\n");
+}
+
+/* ================================================================ */
+
+int main(void)
+{
+    srand(42); /* 재현성을 위한 고정 시드 */
+    gf256_init();
+
+    printf("\n============================================\n");
+    printf("  Mini S3 - 종합 실험 결과\n");
+    printf("============================================\n\n");
+
+    test_gf256();
+    test_erasure_exhaustive();
+    test_erasure_random();
+    test_p2c();
+    bench_throughput();
+    test_tail_latency();
+    print_storage_cmp();
+
+    return 0;
+}

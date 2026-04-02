@@ -12,14 +12,23 @@ $(TARGET): $(OBJS)
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+TEST    = mini_s3_test
+
 main.o: main.c gf256.h erasure.h
 erasure.o: erasure.c erasure.h gf256.h
 gf256.o: gf256.c gf256.h
+test.o: test.c gf256.h erasure.h
+
+$(TEST): test.o gf256.o erasure.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 run: $(TARGET)
 	./$(TARGET)
 
-clean:
-	rm -f $(OBJS) $(TARGET)
+test: $(TEST)
+	./$(TEST)
 
-.PHONY: clean run
+clean:
+	rm -f $(OBJS) test.o $(TARGET) $(TEST)
+
+.PHONY: clean run test
