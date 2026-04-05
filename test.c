@@ -797,6 +797,118 @@ static void test_rebuild_vulnerability(void)
     printf("  -> Rebuild 시간이 길어질수록 격차 확대\n\n");
 }
 
+/* ================================================================
+ * [11] SIMD 최적화 벤치마크
+ *
+ * GF(256) 곱셈-누적의 스칼라 vs SIMD 성능을 비교한다.
+ * SIMD는 split-table 기법: 각 바이트를 hi/lo nibble로 분리하고
+ * 16-entry 테이블 2개로 NEON tbl / SSE pshufb 병렬 lookup.
+ *
+ * 인코딩/디코딩의 핫 패스인 gf256_mul_vec를 직접 벤치마크하고,
+ * 전체 인코딩 파이프라인에서의 실제 스피드업도 측정한다.
+ * ================================================================ */
+
+static void encode_with(void (*mul_vec)(uint8_t *, const uint8_t *, uint8_t, size_t),
+                        erasure_t *ec, uint8_t **shards, size_t ss)
+{
+    int k = ec->data_shards, m = ec->parity_shards;
+    for (int i = 0; i < m; i++) {
+        memset(shards[k + i], 0, ss);
+        for (int j = 0; j < k; j++)
+            mul_vec(shards[k + i], shards[j],
+                    ec->parity_matrix[i * k + j], ss);
+    }
+}
+
+static void bench_simd(void)
+{
+    printf("[11] SIMD 최적화 벤치마크\n");
+    printf("--------------------------------------------\n");
+
+#if defined(__aarch64__)
+    printf("  아키텍처: ARM64 NEON (vqtbl1q_u8)\n");
+#elif defined(__SSSE3__)
+    printf("  아키텍처: x86 SSSE3 (_mm_shuffle_epi8)\n");
+#else
+    printf("  아키텍처: SIMD 없음 (스칼라 fallback)\n");
+#endif
+
+    /* (A) gf256_mul_vec 직접 벤치마크 */
+    size_t len = 1048576; /* 1 MB */
+    uint8_t *dst = calloc(len, 1);
+    uint8_t *src = malloc(len);
+    for (size_t i = 0; i < len; i++) src[i] = rand() & 0xFF;
+    uint8_t c = 0x53;
+    int iters = 500;
+
+    /* scalar */
+    double t0 = now();
+    for (int i = 0; i < iters; i++)
+        gf256_mul_vec_ref(dst, src, c, len);
+    double ref_mbs = (double)len * iters / (now() - t0) / (1024.0 * 1024.0);
+
+    /* SIMD */
+    memset(dst, 0, len);
+    t0 = now();
+    for (int i = 0; i < iters; i++)
+        gf256_mul_vec(dst, src, c, len);
+    double simd_mbs = (double)len * iters / (now() - t0) / (1024.0 * 1024.0);
+
+    printf("\n  gf256_mul_vec (1MB x %d회):\n", iters);
+    printf("  Scalar:  %8.1f MB/s\n", ref_mbs);
+    printf("  SIMD:    %8.1f MB/s\n", simd_mbs);
+    printf("  Speedup: %8.1fx\n", simd_mbs / ref_mbs);
+
+    free(dst); free(src);
+
+    /* (B) 전체 인코딩 파이프라인 벤치마크 */
+    erasure_t ec;
+    erasure_init(&ec, K, M);
+
+    struct { size_t size; const char *label; int iters; } cfgs[] = {
+        {4096,    "4 KB  ", 3000},
+        {65536,   "64 KB ", 500},
+        {1048576, "1 MB  ", 50},
+    };
+    int ncfg = 3;
+
+    printf("\n  인코딩 파이프라인 (Scalar vs SIMD):\n\n");
+    printf("  | 데이터    | Scalar (MB/s) | SIMD (MB/s)   | Speedup |\n");
+    printf("  |----------|--------------|--------------|----------|\n");
+
+    for (int ci = 0; ci < ncfg; ci++) {
+        size_t total = cfgs[ci].size;
+        size_t ss = (total + K - 1) / K;
+        int it = cfgs[ci].iters;
+
+        uint8_t *mem = calloc(N, ss);
+        uint8_t *sh[N];
+        for (int i = 0; i < N; i++)
+            sh[i] = mem + (size_t)i * ss;
+        for (size_t i = 0; i < total; i++)
+            mem[i] = rand() & 0xFF;
+
+        /* scalar encode */
+        t0 = now();
+        for (int i = 0; i < it; i++)
+            encode_with(gf256_mul_vec_ref, &ec, sh, ss);
+        double sc = (double)total * it / (now() - t0) / (1024.0 * 1024.0);
+
+        /* SIMD encode */
+        t0 = now();
+        for (int i = 0; i < it; i++)
+            encode_with(gf256_mul_vec, &ec, sh, ss);
+        double sm = (double)total * it / (now() - t0) / (1024.0 * 1024.0);
+
+        printf("  | %7s  | %12.1f | %12.1f | %7.1fx |\n",
+               cfgs[ci].label, sc, sm, sm / sc);
+        free(mem);
+    }
+
+    printf("\n");
+    erasure_free(&ec);
+}
+
 /* ================================================================ */
 
 int main(void)
@@ -819,6 +931,7 @@ int main(void)
     test_durability();
     test_crc32_corruption();
     test_rebuild_vulnerability();
+    bench_simd();
 
     return 0;
 }

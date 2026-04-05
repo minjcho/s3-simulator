@@ -63,13 +63,9 @@ void erasure_encode(erasure_t *ec, uint8_t **shards, size_t shard_size)
      */
     for (int i = 0; i < m; i++) {
         memset(shards[k + i], 0, shard_size);
-        for (size_t b = 0; b < shard_size; b++) {
-            uint8_t val = 0;
-            for (int j = 0; j < k; j++)
-                val ^= gf256_mul(ec->parity_matrix[i * k + j],
-                                 shards[j][b]);
-            shards[k + i][b] = val;
-        }
+        for (int j = 0; j < k; j++)
+            gf256_mul_vec(shards[k + i], shards[j],
+                          ec->parity_matrix[i * k + j], shard_size);
     }
 }
 
@@ -173,12 +169,10 @@ int erasure_decode(erasure_t *ec, uint8_t **shards, size_t shard_size,
      */
     for (int j = 0; j < k; j++) {
         if (present[j]) continue;
-        for (size_t b = 0; b < shard_size; b++) {
-            uint8_t val = 0;
-            for (int i = 0; i < k; i++)
-                val ^= gf256_mul(inv_mat[j * k + i], shards[sel[i]][b]);
-            shards[j][b] = val;
-        }
+        memset(shards[j], 0, shard_size);
+        for (int i = 0; i < k; i++)
+            gf256_mul_vec(shards[j], shards[sel[i]],
+                          inv_mat[j * k + i], shard_size);
     }
 
     free(sel);
