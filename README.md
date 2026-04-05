@@ -106,18 +106,18 @@ GF(256) 구현이 기본 필드 성질을 만족하는지 검사한다.
 
 다음 표는 한 머신에서 측정한 예시 결과다. 절대 성능 수치보다 인코딩/디코딩 경향을 보는 용도로 해석하는 편이 맞다.
 
-SIMD 최적화(split-table + NEON `vqtbl1q_u8`) 적용 전후 비교. Apple M1 Pro 기준.
+Apple M1 Pro 기준. "before"는 최적화 전(byte-at-a-time 루프 + 스칼라), "after"는 최적화 후(shard-major 루프 + NEON SIMD). 총 개선은 루프 구조 변경(~2x)과 SIMD(~17x) 두 가지의 합산이다. SIMD 단독 기여는 [11. SIMD Optimization](#11-simd-optimization) 참조.
 
-| Data size | Encoding before | Encoding after | Decoding before | Decoding after |
-|----------|----------------:|---------------:|----------------:|---------------:|
-| 1 KB | ~195 MB/s | ~1,794 MB/s | ~242 MB/s | ~1,263 MB/s |
-| 4 KB | ~199 MB/s | ~4,490 MB/s | ~265 MB/s | ~3,762 MB/s |
-| 16 KB | ~199 MB/s | ~5,914 MB/s | ~264 MB/s | ~6,191 MB/s |
-| 64 KB | ~193 MB/s | ~6,372 MB/s | ~266 MB/s | ~7,298 MB/s |
-| 256 KB | ~196 MB/s | ~6,428 MB/s | ~267 MB/s | ~7,606 MB/s |
-| 1 MB | ~190 MB/s | ~6,874 MB/s | ~264 MB/s | ~8,571 MB/s |
+| Data size | Enc. before | Enc. after | Enc. speedup | Dec. before | Dec. after | Dec. speedup |
+|----------|------------:|-----------:|-------------:|------------:|-----------:|-------------:|
+| 1 KB | ~195 | ~1,794 | 9.2x | ~242 | ~1,263 | 5.2x |
+| 4 KB | ~199 | ~4,490 | 22.6x | ~265 | ~3,762 | 14.2x |
+| 16 KB | ~199 | ~5,914 | 29.7x | ~264 | ~6,191 | 23.5x |
+| 64 KB | ~193 | ~6,372 | 33.0x | ~266 | ~7,298 | 27.4x |
+| 256 KB | ~196 | ~6,428 | 32.8x | ~267 | ~7,606 | 28.5x |
+| 1 MB | ~190 | ~6,874 | 36.2x | ~264 | ~8,571 | 32.5x |
 
-1MB 기준 인코딩 **~36x**, 디코딩 **~32x** 향상. 자세한 원리는 아래 [11. SIMD Optimization](#11-simd-optimization) 참조.
+단위: MB/s.
 
 ### 6. Tail-Latency Simulation
 
